@@ -86,7 +86,7 @@ class Logger:
 
 def ssh_run(user, host, key, timeout, cmd, sudo_user=None):
     if sudo_user:
-        remote_cmd = f"sudo -u {sudo_user} bash"
+        remote_cmd = f"sudo su - {sudo_user}"
     else:
         remote_cmd = "bash"
 
@@ -103,7 +103,9 @@ def ssh_run(user, host, key, timeout, cmd, sudo_user=None):
     r = subprocess.run(full, input=cmd, capture_output=True, text=True, timeout=timeout + 5)
     if r.returncode != 0:
         raise RuntimeError(r.stderr.strip() or f"exit code {r.returncode}")
-    return r.stdout.strip()
+    # strip Last login line injected by su login shell
+    lines = [l for l in r.stdout.splitlines() if not l.startswith("Last login:")]
+    return "\n".join(lines).strip()
 
 
 def local_run(cmd):
