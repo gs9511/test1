@@ -132,7 +132,7 @@ def get_remote_cmd(ssh_cfg, host, path, cmd):
 
 def get_redis_version(ssh_cfg, host, port, password):
     cmd = f"redis-cli -h localhost -p {port} -a {password} INFO SERVER 2>/dev/null | grep ^redis_version: | cut -d: -f2 | tr -d '\\r\\n'"
-    return ssh_run(ssh_cfg["user"], host, ssh_cfg["key"], ssh_cfg["timeout"], cmd, ssh_cfg.get("sudo_user"))
+    return ssh_run(ssh_cfg["user"], host, ssh_cfg["key"], ssh_cfg["timeout"], cmd, sudo_user=None)
 
 
 def fetch_version(ssh_cfg, group_name, host, module_name, module_cfg, vault=None):
