@@ -86,7 +86,7 @@ class Logger:
 
 def ssh_run(user, host, key, timeout, cmd, sudo_user=None):
     if sudo_user:
-        remote_cmd = f"sudo su - {sudo_user}"
+        remote_cmd = f"sudo -u {sudo_user} bash"
     else:
         remote_cmd = "bash"
 
