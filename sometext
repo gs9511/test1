@@ -86,13 +86,14 @@ class Logger:
 
 def ssh_run(user, host, key, timeout, cmd, sudo_user=None):
     if sudo_user:
-        cmd = f"sudo su - {sudo_user} -c {cmd!r}"
+        cmd = f"sudo su - {sudo_user} -c '{cmd}'"
     full = [
         "ssh",
         "-i", os.path.expanduser(key),
         "-o", "StrictHostKeyChecking=no",
         "-o", "BatchMode=yes",
         "-o", f"ConnectTimeout={timeout}",
+        "-q",
         f"{user}@{host}",
         cmd
     ]
@@ -131,8 +132,8 @@ def get_remote_cmd(ssh_cfg, host, path, cmd):
 
 
 def get_redis_version(ssh_cfg, host, port, password):
-    inner = f"redis-cli -h {host} -p {port} -a {password} INFO SERVER 2>/dev/null | grep ^redis_version: | cut -d: -f2 | tr -d '\\r\\n'"
-    cmd = f"bash -c {inner!r}"
+    inner = f'redis-cli -h {host} -p {port} -a {password} INFO SERVER 2>/dev/null | grep ^redis_version: | cut -d: -f2 | tr -d "\\r\\n"'
+    cmd = f'bash -c "{inner}"'
     result = ssh_run(ssh_cfg["user"], host, ssh_cfg["key"], ssh_cfg["timeout"], cmd, ssh_cfg.get("sudo_user"))
     if not result:
         raise RuntimeError("empty response from redis-cli")
