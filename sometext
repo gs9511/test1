@@ -1,0 +1,357 @@
+#!/usr/bin/env python3
+
+import subprocess
+import yaml
+import sys
+import os
+import re
+import getpass
+import tempfile
+from datetime import datetime
+
+# ---------------------------------------------------------------------------
+# config
+# ---------------------------------------------------------------------------
+
+def load_config(path):
+    with open(path) as f:
+        return yaml.safe_load(f)
+
+
+def load_vault(cfg):
+    vault_cfg = cfg.get("vault")
+    if not vault_cfg:
+        return {}
+
+    vault_bin  = os.path.expanduser(vault_cfg["ansible_vault_bin"])
+    vault_file = os.path.expanduser(vault_cfg["vault_file"])
+
+    vault_pass = getpass.getpass("Vault password: ")
+
+    # write vault password to a temp file — ansible-vault needs it on disk or via stdin
+    # we use a tempfile with tight permissions, delete immediately after
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".vp", delete=False) as vp:
+        vp.write(vault_pass)
+        vp_path = vp.name
+
+    try:
+        os.chmod(vp_path, 0o600)
+        r = subprocess.run(
+            [vault_bin, "view", "--vault-password-file", vp_path, vault_file],
+            capture_output=True, text=True
+        )
+    finally:
+        os.unlink(vp_path)
+
+    if r.returncode != 0:
+        raise RuntimeError(f"ansible-vault failed: {r.stderr.strip()}")
+
+    return yaml.safe_load(r.stdout)
+
+
+# ---------------------------------------------------------------------------
+# logging
+# ---------------------------------------------------------------------------
+
+class Logger:
+    def __init__(self, log_dir):
+        os.makedirs(log_dir, exist_ok=True)
+        ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        self.path = os.path.join(log_dir, f"version_check_{ts}.log")
+        self._fh = open(self.path, "w")
+
+    def _write(self, level, msg):
+        line = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {level:<5} {msg}"
+        print(line)
+        self._fh.write(line + "\n")
+        self._fh.flush()
+
+    def info(self, msg):  self._write("INFO",  msg)
+    def warn(self, msg):  self._write("WARN",  msg)
+    def error(self, msg): self._write("ERROR", msg)
+
+    def append_report(self, report_text):
+        self._fh.write("\n" + "-" * 60 + "\n")
+        self._fh.write(report_text)
+        self._fh.write("\n" + "-" * 60 + "\n")
+        self._fh.flush()
+
+    def close(self):
+        self._fh.close()
+
+
+# ---------------------------------------------------------------------------
+# version fetchers
+# ---------------------------------------------------------------------------
+
+def ssh_run(user, host, key, timeout, cmd):
+    full = [
+        "ssh",
+        "-i", os.path.expanduser(key),
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "BatchMode=yes",
+        "-o", f"ConnectTimeout={timeout}",
+        f"{user}@{host}",
+        cmd
+    ]
+    r = subprocess.run(full, capture_output=True, text=True, timeout=timeout + 5)
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip() or f"exit code {r.returncode}")
+    return r.stdout.strip()
+
+
+def local_run(cmd):
+    r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=15)
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip() or f"exit code {r.returncode}")
+    return r.stdout.strip()
+
+
+def get_git_tag(ssh_cfg, host, path):
+    cmd = f"cd {path} && git describe --tags --abbrev=0"
+    return ssh_run(ssh_cfg["user"], host, ssh_cfg["key"], ssh_cfg["timeout"], cmd)
+
+
+def get_local_curl(url, jq_filter):
+    cmd = f"curl -s -k '{url}' | jq -r '{jq_filter}'"
+    return local_run(cmd)
+
+
+def get_local_curl_per_host(host, port, path, jq_filter):
+    url = f"http://{host}:{port}{path}"
+    cmd = f"curl -s -k '{url}' | jq -r '{jq_filter}'"
+    return local_run(cmd)
+
+
+def get_remote_cmd(ssh_cfg, host, path, cmd):
+    full_cmd = f"cd {path} && {cmd}"
+    return ssh_run(ssh_cfg["user"], host, ssh_cfg["key"], ssh_cfg["timeout"], full_cmd)
+
+
+def get_redis_version(ssh_cfg, host, port, password):
+    cmd = (
+        f"redis-cli -c -h {host} -p {port} -a {password} INFO SERVER "
+        f"| grep ^redis_version: | cut -d: -f2"
+    )
+    r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=15)
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip() or f"exit code {r.returncode}")
+    return r.stdout.strip()
+
+
+def fetch_version(ssh_cfg, group_name, host, module_name, module_cfg, vault=None):
+    method = module_cfg["method"]
+
+    if method == "git_tag":
+        return get_git_tag(ssh_cfg, host, module_cfg["path"])
+
+    elif method == "local_curl":
+        return get_local_curl(module_cfg["url"], module_cfg["jq"])
+
+    elif method == "local_curl_per_host":
+        return get_local_curl_per_host(
+            host, module_cfg["port"], module_cfg["path"], module_cfg["jq"]
+        )
+
+    elif method == "remote_cmd":
+        return get_remote_cmd(ssh_cfg, host, module_cfg["path"], module_cfg["cmd"])
+
+    elif method == "redis_cli":
+        password = (vault or {}).get(module_name, {}).get("password")
+        if not password:
+            raise RuntimeError("redis password not found in vault")
+        port = module_cfg.get("port", 6379)
+        return get_redis_version(ssh_cfg, host, port, password)
+
+    else:
+        raise ValueError(f"unknown method: {method}")
+
+
+# ---------------------------------------------------------------------------
+# collection
+# ---------------------------------------------------------------------------
+
+def collect(cfg, logger, vault=None):
+    ssh_cfg = cfg["ssh"]
+    results = {}
+    start = datetime.now()
+
+    for group_name, group in cfg["groups"].items():
+        results[group_name] = {}
+        servers = group.get("servers", [])
+        modules = group.get("modules", {})
+
+        for module_name, module_cfg in modules.items():
+            results[group_name][module_name] = []
+            method = module_cfg["method"]
+
+            if method == "local_curl":
+                try:
+                    ver = fetch_version(ssh_cfg, group_name, None, module_name, module_cfg, vault)
+                    logger.info(f"[{group_name}] {module_name} (local) -> {ver}")
+                    results[group_name][module_name].append(("local", ver))
+                except Exception as e:
+                    msg = str(e)
+                    logger.error(f"[{group_name}] {module_name} (local) -> {msg}")
+                    results[group_name][module_name].append(("local", f"ERROR: {msg}"))
+                continue
+
+            for host in servers:
+                try:
+                    ver = fetch_version(ssh_cfg, group_name, host, module_name, module_cfg, vault)
+                    logger.info(f"[{group_name}] {host} {module_name} -> {ver}")
+                    results[group_name][module_name].append((host, ver))
+                except Exception as e:
+                    msg = str(e)
+                    logger.error(f"[{group_name}] {host} {module_name} -> {msg}")
+                    results[group_name][module_name].append((host, f"ERROR: {msg}"))
+
+    elapsed = int((datetime.now() - start).total_seconds())
+    return results, elapsed
+
+
+# ---------------------------------------------------------------------------
+# report
+# ---------------------------------------------------------------------------
+
+def detect_drift(entries):
+    versions = [v for _, v in entries if not v.startswith("ERROR")]
+    if not versions:
+        return False
+    return len(set(versions)) > 1
+
+
+def build_report(results, elapsed, error_count, drift_count):
+    lines = []
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lines.append("=" * 60)
+    lines.append(f"VERSION CHECK REPORT — {ts}")
+    lines.append("=" * 60)
+
+    col_module  = 20
+    col_host    = 28
+    col_version = 16
+
+    for group_name, modules in results.items():
+        lines.append(f"\n[{group_name}]")
+
+        for module_name, entries in modules.items():
+            # single local entry — print inline
+            if len(entries) == 1 and entries[0][0] == "local":
+                host, ver = entries[0]
+                lines.append(f"  {module_name:<{col_module}} {ver}")
+                continue
+
+            lines.append(f"  {module_name}")
+            drifted = detect_drift(entries)
+            versions_seen = {}
+            for host, ver in entries:
+                if not ver.startswith("ERROR"):
+                    versions_seen.setdefault(ver, 0)
+                    versions_seen[ver] += 1
+
+            # determine baseline (most common version)
+            baseline = max(versions_seen, key=versions_seen.get) if versions_seen else None
+
+            for host, ver in entries:
+                flag = ""
+                if ver.startswith("ERROR"):
+                    flag = "  << ERROR"
+                elif drifted and ver != baseline:
+                    flag = "  << DRIFT"
+                lines.append(f"    {host:<{col_host}} {ver}{flag}")
+
+    # summary
+    lines.append("\n" + "-" * 60)
+    lines.append("SUMMARY")
+
+    for group_name, modules in results.items():
+        for module_name, entries in modules.items():
+            if len(entries) == 1 and entries[0][0] == "local":
+                ver = entries[0][1]
+                lines.append(f"  {module_name:<22} {ver}")
+                continue
+
+            errors = [v for _, v in entries if v.startswith("ERROR")]
+            versions = [v for _, v in entries if not v.startswith("ERROR")]
+            unique = {}
+            for v in versions:
+                unique.setdefault(v, 0)
+                unique[v] += 1
+
+            if errors and not versions:
+                status = "ERROR"
+                detail = f"{len(errors)} error(s)"
+            elif detect_drift(entries):
+                status = "DRIFT"
+                detail = ", ".join(f"{v} ({c})" for v, c in sorted(unique.items()))
+                if errors:
+                    detail += f", {len(errors)} error(s)"
+            else:
+                status = "ok"
+                detail = versions[0] if versions else "no data"
+
+            lines.append(f"  {module_name:<22} {status:<8} {detail}")
+
+    lines.append("")
+    lines.append(f"  elapsed: {elapsed}s   errors: {error_count}   drift: {drift_count}")
+    lines.append("-" * 60)
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+def main():
+    config_path = sys.argv[1] if len(sys.argv) > 1 else "config.yaml"
+
+    if not os.path.exists(config_path):
+        print(f"config not found: {config_path}")
+        sys.exit(1)
+
+    cfg = load_config(config_path)
+    logger = Logger(cfg.get("log_dir", "logs"))
+
+    vault = {}
+    if cfg.get("vault"):
+        try:
+            vault = load_vault(cfg)
+        except Exception as e:
+            print(f"vault error: {e}")
+            sys.exit(1)
+
+    logger.info("starting version check")
+
+    results, elapsed = collect(cfg, logger, vault)
+
+    # count errors and drift
+    error_count = 0
+    drift_count = 0
+    for group_name, modules in results.items():
+        for module_name, entries in modules.items():
+            error_count += sum(1 for _, v in entries if v.startswith("ERROR"))
+            if detect_drift(entries):
+                drift_count += 1
+                logger.warn(
+                    f"drift detected: {module_name} "
+                    + ", ".join(
+                        f"{v} ({sum(1 for _, vv in entries if vv == v)})"
+                        for v in sorted(set(v for _, v in entries if not v.startswith("ERROR")))
+                    )
+                )
+
+    logger.info(f"completed in {elapsed}s — errors: {error_count}  drift: {drift_count}")
+
+    report = build_report(results, elapsed, error_count, drift_count)
+
+    print("\n")
+    print(report)
+
+    logger.append_report(report)
+    logger.close()
+
+
+if __name__ == "__main__":
+    main()
