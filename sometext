@@ -111,7 +111,8 @@ def local_run(cmd):
 
 
 def get_git_tag(ssh_cfg, host, path):
-    cmd = f"cd {path} && git describe --tags --abbrev=0"
+    inner = f"cd {path} && git describe --tags --abbrev=0"
+    cmd = f'bash -c "{inner}"'
     return ssh_run(ssh_cfg["user"], host, ssh_cfg["key"], ssh_cfg["timeout"], cmd, ssh_cfg.get("sudo_user"))
 
 
@@ -127,7 +128,8 @@ def get_local_curl_per_host(host, port, path, jq_filter):
 
 
 def get_remote_cmd(ssh_cfg, host, path, cmd):
-    full_cmd = f"cd {path} && {cmd}"
+    inner = f"cd {path} && {cmd}"
+    full_cmd = f'bash -c "{inner}"'
     return ssh_run(ssh_cfg["user"], host, ssh_cfg["key"], ssh_cfg["timeout"], full_cmd, ssh_cfg.get("sudo_user"))
 
 
