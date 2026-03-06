@@ -84,7 +84,9 @@ class Logger:
 # version fetchers
 # ---------------------------------------------------------------------------
 
-def ssh_run(user, host, key, timeout, cmd):
+def ssh_run(user, host, key, timeout, cmd, sudo_user=None):
+    if sudo_user:
+        cmd = f"sudo su - {sudo_user} -c {cmd!r}"
     full = [
         "ssh",
         "-i", os.path.expanduser(key),
@@ -109,7 +111,7 @@ def local_run(cmd):
 
 def get_git_tag(ssh_cfg, host, path):
     cmd = f"cd {path} && git describe --tags --abbrev=0"
-    return ssh_run(ssh_cfg["user"], host, ssh_cfg["key"], ssh_cfg["timeout"], cmd)
+    return ssh_run(ssh_cfg["user"], host, ssh_cfg["key"], ssh_cfg["timeout"], cmd, ssh_cfg.get("sudo_user"))
 
 
 def get_local_curl(url, jq_filter):
@@ -125,7 +127,7 @@ def get_local_curl_per_host(host, port, path, jq_filter):
 
 def get_remote_cmd(ssh_cfg, host, path, cmd):
     full_cmd = f"cd {path} && {cmd}"
-    return ssh_run(ssh_cfg["user"], host, ssh_cfg["key"], ssh_cfg["timeout"], full_cmd)
+    return ssh_run(ssh_cfg["user"], host, ssh_cfg["key"], ssh_cfg["timeout"], full_cmd, ssh_cfg.get("sudo_user"))
 
 
 def get_redis_version(ssh_cfg, host, port, password):
